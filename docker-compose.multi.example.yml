@@ -1,0 +1,51 @@
+services:
+  novel-proofreader-pokemon:
+    build: .
+    container_name: novel-proofreader-pokemon
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      HOST: 0.0.0.0
+      PORT: 8010
+    ports:
+      - "8010:8010"
+    volumes:
+      - ./chapters:/app/chapters
+      - ./glossary:/app/glossary
+      - ./glossary_raw:/app/glossary_raw
+      - ./reports:/app/reports
+
+  novel-proofreader-story2:
+    build: .
+    container_name: novel-proofreader-story2
+    restart: unless-stopped
+    env_file:
+      - ../story2/.env
+    environment:
+      HOST: 0.0.0.0
+      PORT: 8010
+    ports:
+      - "8011:8010"
+    volumes:
+      - ../story2/chapters:/app/chapters
+      - ../story2/glossary:/app/glossary
+      - ../story2/glossary_raw:/app/glossary_raw
+      - ../story2/reports:/app/reports
+
+  novel-proofreader-story3:
+    build: .
+    container_name: novel-proofreader-story3
+    restart: unless-stopped
+    env_file:
+      - ../story3/.env
+    environment:
+      HOST: 0.0.0.0
+      PORT: 8010
+    ports:
+      - "8012:8010"
+    volumes:
+      - ../story3/chapters:/app/chapters
+      - ../story3/glossary:/app/glossary
+      - ../story3/glossary_raw:/app/glossary_raw
+      - ../story3/reports:/app/reports

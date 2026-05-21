@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+*.pyo
+*.prepare.md
+.env
+chapters/source/**/*.md
+chapters/source/**/*.txt
+chapters/reviewed/
+reports/proofreading/
+reports/glossary_updates/*.md

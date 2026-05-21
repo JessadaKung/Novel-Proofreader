@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+*.pyo
+.git/
+.env
+reports/proofreading/
+reports/glossary_updates/*.md
+chapters/reviewed/
