@@ -1670,7 +1670,10 @@ INDEX_HTML = r"""<!doctype html>
     }
 
     function applyBatchStatus(job) {
-      if (!job || job.status === "idle") return;
+      if (!job || job.status === "idle") {
+        clearServerBatchDisplay();
+        return;
+      }
       queue = Array.isArray(job.queue) ? job.queue : [];
       runStats = {
         done: job.done || 0,
@@ -1702,6 +1705,32 @@ INDEX_HTML = r"""<!doctype html>
       $("stopAuto").disabled = !job.running;
       setStatus(job.running ? `กำลังตรวจบน server: ${completed}/${total}` : (job.status === "completed" ? "ตรวจคิวครบแล้ว" : "หยุดแล้ว"));
       saveSharedState();
+    }
+
+    function clearServerBatchDisplay() {
+      if (batchPollTimer) {
+        clearInterval(batchPollTimer);
+        batchPollTimer = null;
+      }
+      try {
+        const state = JSON.parse(localStorage.getItem(sharedStateKey) || "null");
+        if (state && state.statusText && String(state.statusText).includes("server")) {
+          localStorage.removeItem(sharedStateKey);
+        }
+      } catch (_) {}
+      queue = [];
+      runStats = {done: 0, skipped: 0, failed: 0, total: 0};
+      runLog = [];
+      renderQueue();
+      setProgress(0, 0);
+      resetChapterProgress();
+      $("summary").textContent = "";
+      $("changes").textContent = "";
+      $("sourceFile").value = "";
+      $("runLog").textContent = "ยังไม่ได้เริ่ม";
+      $("autoReview").disabled = false;
+      $("stopAuto").disabled = true;
+      setStatus("พร้อม");
     }
 
     async function pollBatchStatus() {
