@@ -65,3 +65,13 @@ AUTH_PASSWORD=use-a-long-random-password
 ```
 
 The app includes a File Manager, so public deployments must be password protected.
+
+## Discord Notifications
+
+Set a Discord webhook URL to receive notifications when a batch starts, finishes, stops, or hits file errors.
+
+```env
+DISCORD_WEBHOOK_URL=https://discord.com/api/webhooks/...
+```
+
+You can also set and test it from the app settings sidebar.

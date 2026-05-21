@@ -74,6 +74,9 @@ def write_env_values(updates: dict[str, str]) -> None:
         "GOOGLE_RETRY_COUNT",
         "GOOGLE_RETRY_DELAY_SECONDS",
         "GOOGLE_TIMEOUT_SECONDS",
+        "DISCORD_WEBHOOK_URL",
+        "AUTH_USERNAME",
+        "AUTH_PASSWORD",
     ]
     lines = ["# Google Gemini API"]
     for key in ordered_keys:
@@ -100,7 +103,38 @@ def public_config() -> dict[str, str]:
         "GOOGLE_RETRY_COUNT": values.get("GOOGLE_RETRY_COUNT", "3"),
         "GOOGLE_RETRY_DELAY_SECONDS": values.get("GOOGLE_RETRY_DELAY_SECONDS", "4"),
         "GOOGLE_TIMEOUT_SECONDS": values.get("GOOGLE_TIMEOUT_SECONDS", "300"),
+        "DISCORD_WEBHOOK_SET": "true" if values.get("DISCORD_WEBHOOK_URL", "") else "false",
+        "DISCORD_WEBHOOK_PREVIEW": f"...{values.get('DISCORD_WEBHOOK_URL', '')[-8:]}" if values.get("DISCORD_WEBHOOK_URL", "") else "",
     }
+
+
+def send_discord_notification(title: str, message: str, color: int = 0x47A3FF) -> bool:
+    load_env()
+    webhook_url = os.environ.get("DISCORD_WEBHOOK_URL", "").strip()
+    if not webhook_url:
+        return False
+    payload = {
+        "embeds": [
+            {
+                "title": title[:256],
+                "description": message[:4000],
+                "color": color,
+                "timestamp": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+            }
+        ]
+    }
+    request = urllib.request.Request(
+        webhook_url,
+        data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=20):
+            return True
+    except Exception as exc:
+        print(f"Discord webhook failed: {exc}")
+        return False
 
 
 def auth_enabled() -> bool:
@@ -695,14 +729,33 @@ def update_config_from_body(body: dict) -> dict[str, str]:
         "GOOGLE_RETRY_COUNT": body.get("GOOGLE_RETRY_COUNT", "3").strip() or "3",
         "GOOGLE_RETRY_DELAY_SECONDS": body.get("GOOGLE_RETRY_DELAY_SECONDS", "4").strip() or "4",
         "GOOGLE_TIMEOUT_SECONDS": body.get("GOOGLE_TIMEOUT_SECONDS", "300").strip() or "300",
+        "DISCORD_WEBHOOK_URL": body.get("DISCORD_WEBHOOK_URL", "").strip(),
     }
     api_key = body.get("GOOGLE_API_KEY", "").strip()
     if api_key:
         updates["GOOGLE_API_KEY"] = api_key
+    if not updates["DISCORD_WEBHOOK_URL"]:
+        updates.pop("DISCORD_WEBHOOK_URL")
     if not updates["LLM_MODEL"]:
         updates["LLM_MODEL"] = "gemma-4-31b-it"
     write_env_values(updates)
     return public_config()
+
+
+def notify_from_body(body: dict) -> dict[str, bool]:
+    level = body.get("level", "info")
+    colors = {
+        "info": 0x47A3FF,
+        "success": 0x3CCF91,
+        "warning": 0xD8AD4C,
+        "error": 0xE06161,
+    }
+    sent = send_discord_notification(
+        body.get("title", "Novel Proofreader"),
+        body.get("message", ""),
+        colors.get(level, colors["info"]),
+    )
+    return {"sent": sent}
 
 
 def save_review(source_file: str, original: str, result: dict) -> dict[str, str]:
@@ -1199,7 +1252,13 @@ INDEX_HTML = r"""<!doctype html>
             <input id="timeoutSeconds" type="number" min="30" step="30">
           </div>
         </div>
+        <div>
+          <label for="discordWebhook">Discord webhook</label>
+          <input id="discordWebhook" type="password" placeholder="เว้นว่างไว้ถ้าไม่เปลี่ยน">
+          <div class="sub" id="discordPreview">ยังไม่ได้โหลดค่า</div>
+        </div>
         <button class="success" id="saveConfig">บันทึกค่า API</button>
+        <button class="secondary" id="testDiscord">ทดสอบ Discord</button>
         <button class="secondary" id="checkModels">เช็กโมเดล Google</button>
         <div class="queue" id="models">ยังไม่ได้เช็ก</div>
       </div>
@@ -1464,6 +1523,17 @@ INDEX_HTML = r"""<!doctype html>
       return data;
     }
 
+    async function notifyDiscord(title, message, level="info") {
+      try {
+        await api("/api/notify", {
+          method: "POST",
+          body: JSON.stringify({title, message, level})
+        });
+      } catch (err) {
+        appendLog(`Discord notify failed: ${err.message}`);
+      }
+    }
+
     async function loadChapters() {
       const data = await api("/api/chapters");
       $("chapter").innerHTML = data.chapters.map(c => `<option value="${c.path}">${c.name}</option>`).join("");
@@ -1480,6 +1550,7 @@ INDEX_HTML = r"""<!doctype html>
       $("fallbackModels").value = data.GOOGLE_FALLBACK_MODELS || "";
       $("retryCount").value = data.GOOGLE_RETRY_COUNT || "3";
       $("timeoutSeconds").value = data.GOOGLE_TIMEOUT_SECONDS || "300";
+      $("discordPreview").textContent = data.DISCORD_WEBHOOK_SET === "true" ? `ตั้งค่าแล้ว ${data.DISCORD_WEBHOOK_PREVIEW}` : "ยังไม่มี webhook";
       const currentModel = data.LLM_MODEL || "gemma-4-31b-it";
       $("modelSelect").innerHTML = `<option value="${currentModel}">${currentModel}</option>`;
       $("modelSelect").value = currentModel;
@@ -1660,6 +1731,7 @@ INDEX_HTML = r"""<!doctype html>
       runStats = {done: 0, skipped: 0, failed: 0, total: queue.length};
       setProgress(0, queue.length);
       appendLog("เริ่มตรวจอัตโนมัติ");
+      notifyDiscord("Novel Proofreader: เริ่มตรวจคิว", `เริ่มตรวจ ${queue.length} ไฟล์`, "info");
       $("autoReview").disabled = true;
       $("stopAuto").disabled = false;
       $("review").disabled = true;
@@ -1700,15 +1772,23 @@ INDEX_HTML = r"""<!doctype html>
             done[item.path] = "ผิดพลาด";
             runStats.failed += 1;
             appendLog(`ผิดพลาด ${item.path}: ${err.message}`);
+            notifyDiscord("Novel Proofreader: ตรวจไฟล์ผิดพลาด", `${item.path}\n${err.message}`, "error");
             finishChapterProgress("ผิดพลาด");
           }
           setProgress(runStats.done + runStats.skipped + runStats.failed, queue.length);
           renderQueue(-1, done);
         }
+        const finalMessage = `ทั้งหมด ${queue.length} | เสร็จ ${runStats.done} | ข้าม ${runStats.skipped} | พลาด ${runStats.failed}`;
         appendLog(stopRequested ? "หยุดแล้วหลังไฟล์ล่าสุด" : "ตรวจคิวครบแล้ว");
+        notifyDiscord(
+          stopRequested ? "Novel Proofreader: หยุดตรวจคิว" : "Novel Proofreader: ตรวจคิวเสร็จ",
+          finalMessage,
+          runStats.failed ? "warning" : "success"
+        );
         setStatus(stopRequested ? "หยุดแล้วหลังไฟล์ล่าสุด" : "ตรวจคิวครบแล้ว");
       } catch (err) {
         setStatus(err.message, true);
+        notifyDiscord("Novel Proofreader: Batch error", err.message, "error");
       } finally {
         $("autoReview").disabled = false;
         $("stopAuto").disabled = true;
@@ -1796,16 +1876,35 @@ INDEX_HTML = r"""<!doctype html>
           LLM_MODEL: $("modelSelect").value.trim(),
           GOOGLE_FALLBACK_MODELS: $("fallbackModels").value.trim(),
           GOOGLE_RETRY_COUNT: $("retryCount").value.trim(),
-          GOOGLE_TIMEOUT_SECONDS: $("timeoutSeconds").value.trim()
+          GOOGLE_TIMEOUT_SECONDS: $("timeoutSeconds").value.trim(),
+          DISCORD_WEBHOOK_URL: $("discordWebhook").value.trim()
         };
         const data = await api("/api/config", {method: "POST", body: JSON.stringify(payload)});
         $("googleApiKey").value = "";
+        $("discordWebhook").value = "";
         $("apiKeyPreview").textContent = data.GOOGLE_API_KEY_SET === "true" ? `ตั้งค่าแล้ว ${data.GOOGLE_API_KEY_PREVIEW}` : "ยังไม่มี API key";
+        $("discordPreview").textContent = data.DISCORD_WEBHOOK_SET === "true" ? `ตั้งค่าแล้ว ${data.DISCORD_WEBHOOK_PREVIEW}` : "ยังไม่มี webhook";
         setStatus("บันทึกค่า API แล้ว");
       } catch (err) {
         setStatus(err.message, true);
       } finally {
         $("saveConfig").disabled = false;
+      }
+    };
+
+    $("testDiscord").onclick = async () => {
+      $("testDiscord").disabled = true;
+      setStatus("กำลังส่งทดสอบ Discord...");
+      try {
+        const data = await api("/api/notify", {
+          method: "POST",
+          body: JSON.stringify({title: "Novel Proofreader", message: "Discord webhook test สำเร็จ", level: "info"})
+        });
+        setStatus(data.sent ? "ส่ง Discord แล้ว" : "ยังไม่ได้ตั้งค่า Discord webhook");
+      } catch (err) {
+        setStatus(err.message, true);
+      } finally {
+        $("testDiscord").disabled = false;
       }
     };
 
@@ -2054,6 +2153,9 @@ class Handler(BaseHTTPRequestHandler):
             elif self.path == "/api/config":
                 body = self.read_json_body()
                 self.send_json(update_config_from_body(body))
+            elif self.path == "/api/notify":
+                body = self.read_json_body()
+                self.send_json(notify_from_body(body))
             elif self.path == "/api/auto-review":
                 body = self.read_json_body()
                 result = auto_review_chapter(body.get("path", ""))
