@@ -1415,6 +1415,8 @@ INDEX_HTML = r"""<!doctype html>
     let chapterStartedAt = null;
     let chapterEstimatedPercent = 0;
     let selectedFile = null;
+    const sharedStateKey = "novelProofreader.batchState.v1";
+    let applyingSharedState = false;
 
     function showPage(page) {
       const files = page === "files";
@@ -1432,6 +1434,7 @@ INDEX_HTML = r"""<!doctype html>
       if (runLog.length > 120) runLog = runLog.slice(-120);
       $("runLog").textContent = runLog.join("\n");
       $("runLog").scrollTop = $("runLog").scrollHeight;
+      saveSharedState();
     }
 
     function setProgress(done, total) {
@@ -1446,6 +1449,7 @@ INDEX_HTML = r"""<!doctype html>
       $("metricDone").textContent = runStats.done;
       $("metricSkipped").textContent = runStats.skipped;
       $("metricFailed").textContent = runStats.failed;
+      saveSharedState();
     }
 
     function formatElapsed(ms) {
@@ -1461,6 +1465,7 @@ INDEX_HTML = r"""<!doctype html>
       $("chapterProgressStage").textContent = `${chapterEstimatedPercent}%`;
       $("chapterProgressText").textContent = stage;
       if (file) $("chapterProgressName").textContent = file;
+      saveSharedState();
     }
 
     function startChapterProgress(file) {
@@ -1469,6 +1474,7 @@ INDEX_HTML = r"""<!doctype html>
       chapterEstimatedPercent = 0;
       setChapterProgress(8, "อ่านไฟล์และเตรียม prompt", file);
       $("chapterProgressTime").textContent = "00:00";
+      saveSharedState();
       chapterTimer = setInterval(() => {
         if (!chapterStartedAt) return;
         const elapsed = Date.now() - chapterStartedAt;
@@ -1499,7 +1505,80 @@ INDEX_HTML = r"""<!doctype html>
       $("chapterProgressText").textContent = "รอเริ่ม";
       $("chapterProgressTime").textContent = "00:00";
       $("chapterProgressName").textContent = "ยังไม่ได้เริ่ม";
+      saveSharedState();
     }
+
+    function saveSharedState() {
+      if (applyingSharedState) return;
+      try {
+        localStorage.setItem(sharedStateKey, JSON.stringify({
+          queue,
+          runStats,
+          runLog,
+          sourceFile: $("sourceFile").value,
+          statusText: $("status").textContent,
+          summary: $("summary").textContent,
+          changes: $("changes").textContent,
+          progressText: $("progressText").textContent,
+          progressCounts: $("progressCounts").textContent,
+          progressWidth: $("progressFill").style.width,
+          mainProgressText: $("mainProgressText").textContent,
+          mainProgressCounts: $("mainProgressCounts").textContent,
+          chapterName: $("chapterProgressName").textContent,
+          chapterStage: $("chapterProgressStage").textContent,
+          chapterText: $("chapterProgressText").textContent,
+          chapterTime: $("chapterProgressTime").textContent,
+          chapterWidth: $("chapterProgressFill").style.width,
+          updatedAt: Date.now()
+        }));
+      } catch (_) {}
+    }
+
+    function applySharedState(state) {
+      if (!state || !state.updatedAt) return;
+      applyingSharedState = true;
+      try {
+        queue = Array.isArray(state.queue) ? state.queue : queue;
+        runStats = state.runStats || runStats;
+        runLog = Array.isArray(state.runLog) ? state.runLog : runLog;
+        $("sourceFile").value = state.sourceFile || "";
+        $("status").textContent = state.statusText || "พร้อม";
+        $("summary").textContent = state.summary || "";
+        $("changes").textContent = state.changes || "";
+        $("runLog").textContent = runLog.join("\n") || "ยังไม่ได้เริ่ม";
+        $("progressFill").style.width = state.progressWidth || "0%";
+        $("mainProgressFill").style.width = state.progressWidth || "0%";
+        $("progressText").textContent = state.progressText || "0%";
+        $("progressCounts").textContent = state.progressCounts || "0/0";
+        $("mainProgressText").textContent = state.mainProgressText || state.progressText || "0%";
+        $("mainProgressCounts").textContent = state.mainProgressCounts || state.progressCounts || "0/0";
+        $("chapterProgressName").textContent = state.chapterName || "ยังไม่ได้เริ่ม";
+        $("chapterProgressStage").textContent = state.chapterStage || "0%";
+        $("chapterProgressText").textContent = state.chapterText || "รอเริ่ม";
+        $("chapterProgressTime").textContent = state.chapterTime || "00:00";
+        $("chapterProgressFill").style.width = state.chapterWidth || "0%";
+        $("metricTotal").textContent = runStats.total || queue.length || 0;
+        $("metricDone").textContent = runStats.done || 0;
+        $("metricSkipped").textContent = runStats.skipped || 0;
+        $("metricFailed").textContent = runStats.failed || 0;
+        renderQueue();
+      } finally {
+        applyingSharedState = false;
+      }
+    }
+
+    function loadSharedState() {
+      try {
+        applySharedState(JSON.parse(localStorage.getItem(sharedStateKey) || "null"));
+      } catch (_) {}
+    }
+
+    window.addEventListener("storage", (event) => {
+      if (event.key !== sharedStateKey || !event.newValue) return;
+      try {
+        applySharedState(JSON.parse(event.newValue));
+      } catch (_) {}
+    });
 
     function queueMarker(item, index, activeIndex, done) {
       if (done[item.path]) return done[item.path];
@@ -1511,17 +1590,20 @@ INDEX_HTML = r"""<!doctype html>
     function renderQueue(activeIndex=-1, done={}) {
       if (!queue.length) {
         $("queue").textContent = "ยังไม่มีคิว";
+        saveSharedState();
         return;
       }
       $("queue").textContent = queue.map((item, index) => {
         const marker = queueMarker(item, index, activeIndex, done);
         return `${index + 1}. [${marker}] ${item.path}`;
       }).join("\n");
+      saveSharedState();
     }
 
     function setStatus(text, isError=false) {
       $("status").textContent = text;
       $("status").className = isError ? "status error" : "status";
+      saveSharedState();
     }
 
     function setFileStatus(text, isError=false) {
@@ -2001,7 +2083,9 @@ INDEX_HTML = r"""<!doctype html>
       }
     };
 
-    Promise.all([loadChapters(), loadFolders(), loadConfig()]).catch(err => setStatus(err.message, true));
+    Promise.all([loadChapters(), loadFolders(), loadConfig()])
+      .then(loadSharedState)
+      .catch(err => setStatus(err.message, true));
   </script>
 </body>
 </html>
