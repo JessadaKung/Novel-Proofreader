@@ -985,6 +985,14 @@ def stop_batch_job() -> dict:
     return batch_snapshot()
 
 
+def reset_batch_job() -> dict:
+    global BATCH_JOB, BATCH_STOP_REQUESTED
+    with BATCH_LOCK:
+        BATCH_STOP_REQUESTED = True
+        BATCH_JOB = None
+    return {"running": False, "status": "idle", "reset": True}
+
+
 INDEX_HTML = r"""<!doctype html>
 <html lang="th">
 <head>
@@ -1351,6 +1359,7 @@ INDEX_HTML = r"""<!doctype html>
           <button id="autoReview">ตรวจอัตโนมัติ</button>
           <button class="danger" id="stopAuto" disabled>หยุด</button>
         </div>
+        <button class="secondary" id="resetBatch">รีเซ็ตคิวค้าง</button>
         <div>
           <label>คิวตรวจ</label>
           <div class="queue" id="queue">ยังไม่มีคิว</div>
@@ -2095,6 +2104,18 @@ INDEX_HTML = r"""<!doctype html>
       setStatus("รับคำสั่งหยุดแล้ว จะหยุดหลังไฟล์ปัจจุบันเสร็จ");
     };
 
+    $("resetBatch").onclick = async () => {
+      if (!confirm("รีเซ็ตคิวที่ค้างอยู่? งานปัจจุบันจะถูกล้างจากหน้าจอ แต่ request ที่ส่งไปแล้วอาจจบเองภายหลัง")) return;
+      try {
+        await api("/api/batch-reset", {method: "POST", body: "{}"});
+        localStorage.removeItem(sharedStateKey);
+        clearServerBatchDisplay();
+        setStatus("รีเซ็ตคิวแล้ว");
+      } catch (err) {
+        setStatus(err.message, true);
+      }
+    };
+
     $("checkModels").onclick = async () => {
       $("checkModels").disabled = true;
       setStatus("กำลังเช็กโมเดลจาก Google...");
@@ -2459,6 +2480,8 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json(start_batch_job(body.get("folder", ""), bool(body.get("skip_reviewed", True))))
             elif self.path == "/api/batch-stop":
                 self.send_json(stop_batch_job())
+            elif self.path == "/api/batch-reset":
+                self.send_json(reset_batch_job())
             elif self.path == "/api/auto-review":
                 body = self.read_json_body()
                 result = auto_review_chapter(body.get("path", ""))
