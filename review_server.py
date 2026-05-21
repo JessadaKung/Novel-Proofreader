@@ -11,6 +11,8 @@ import socket
 import shutil
 import zipfile
 import tempfile
+import threading
+import uuid
 from email import policy
 from email.parser import BytesParser
 from datetime import UTC, datetime
@@ -37,6 +39,9 @@ EDITABLE_SUFFIXES = {".md", ".txt", ".json", ".yml", ".yaml", ".env", ".example"
 
 HOST = os.environ.get("HOST", "127.0.0.1")
 PORT = int(os.environ.get("PORT", "8010"))
+BATCH_LOCK = threading.Lock()
+BATCH_JOB: dict | None = None
+BATCH_STOP_REQUESTED = False
 
 
 def load_env() -> None:
@@ -835,6 +840,146 @@ def auto_review_chapter(chapter_path: str) -> dict:
     }
 
 
+def append_batch_log(job: dict, text: str) -> None:
+    stamp = datetime.now().strftime("%H:%M:%S")
+    job.setdefault("log", []).append(f"[{stamp}] {text}")
+    job["log"] = job["log"][-200:]
+
+
+def batch_snapshot() -> dict:
+    with BATCH_LOCK:
+        return json.loads(json.dumps(BATCH_JOB)) if BATCH_JOB else {"running": False, "status": "idle"}
+
+
+def update_batch_job(**updates) -> None:
+    with BATCH_LOCK:
+        if BATCH_JOB is not None:
+            BATCH_JOB.update(updates)
+
+
+def run_batch_job(job_id: str, chapters: list[dict], skip_reviewed: bool) -> None:
+    global BATCH_STOP_REQUESTED
+    send_discord_notification("Novel Proofreader: เริ่มตรวจคิว", f"เริ่มตรวจ {len(chapters)} ไฟล์", 0x47A3FF)
+    for index, item in enumerate(chapters):
+        with BATCH_LOCK:
+            if BATCH_JOB is None or BATCH_JOB.get("id") != job_id:
+                return
+            if BATCH_STOP_REQUESTED:
+                BATCH_JOB["status"] = "stopped"
+                BATCH_JOB["running"] = False
+                append_batch_log(BATCH_JOB, "หยุดตามคำสั่ง")
+                break
+            BATCH_JOB["current_index"] = index
+            BATCH_JOB["current_file"] = item["path"]
+            BATCH_JOB["current_stage"] = "เริ่มตรวจ"
+            BATCH_JOB["current_percent"] = 10
+            append_batch_log(BATCH_JOB, f"เริ่มตรวจ {item['path']}")
+
+        if skip_reviewed and item.get("reviewed"):
+            with BATCH_LOCK:
+                if BATCH_JOB is None:
+                    return
+                BATCH_JOB["skipped"] += 1
+                BATCH_JOB["completed"] += 1
+                BATCH_JOB["queue"][index]["status"] = "ข้าม/เสร็จแล้ว"
+                BATCH_JOB["current_percent"] = 100
+                BATCH_JOB["current_stage"] = "ข้าม"
+                append_batch_log(BATCH_JOB, f"ข้าม {item['path']} เพราะมีผลตรวจแล้ว")
+            continue
+
+        try:
+            update_batch_job(current_stage="ส่งคำขอไป Google API", current_percent=25)
+            result = auto_review_chapter(item["path"])
+            with BATCH_LOCK:
+                if BATCH_JOB is None:
+                    return
+                needs_review = bool(result.get("needs_review"))
+                BATCH_JOB["done"] += 1
+                BATCH_JOB["completed"] += 1
+                BATCH_JOB["queue"][index]["status"] = "เสร็จ/ต้องทวน" if needs_review else "เสร็จ"
+                BATCH_JOB["queue"][index]["reviewed"] = True
+                BATCH_JOB["summary"] = result.get("summary", "")
+                BATCH_JOB["changes"] = (
+                    f"บันทึก: {result.get('reviewed_path')}\n"
+                    f"รายงาน: {result.get('report_path')}\n"
+                    f"changes: {result.get('changes_count')}"
+                )
+                BATCH_JOB["current_stage"] = "เสร็จ แต่ต้องทวน" if needs_review else "เสร็จ"
+                BATCH_JOB["current_percent"] = 100
+                append_batch_log(BATCH_JOB, f"เสร็จ {item['path']} changes={result.get('changes_count')}")
+        except Exception as exc:
+            with BATCH_LOCK:
+                if BATCH_JOB is None:
+                    return
+                BATCH_JOB["failed"] += 1
+                BATCH_JOB["completed"] += 1
+                BATCH_JOB["queue"][index]["status"] = "ผิดพลาด"
+                BATCH_JOB["current_stage"] = "ผิดพลาด"
+                BATCH_JOB["current_percent"] = 100
+                append_batch_log(BATCH_JOB, f"ผิดพลาด {item['path']}: {exc}")
+            send_discord_notification("Novel Proofreader: ตรวจไฟล์ผิดพลาด", f"{item['path']}\n{exc}", 0xE06161)
+
+    with BATCH_LOCK:
+        if BATCH_JOB is not None and BATCH_JOB.get("id") == job_id:
+            if BATCH_JOB.get("status") != "stopped":
+                BATCH_JOB["status"] = "completed"
+                BATCH_JOB["running"] = False
+                append_batch_log(BATCH_JOB, "ตรวจคิวครบแล้ว")
+            final = (
+                f"ทั้งหมด {BATCH_JOB['total']} | เสร็จ {BATCH_JOB['done']} | "
+                f"ข้าม {BATCH_JOB['skipped']} | พลาด {BATCH_JOB['failed']}"
+            )
+            failed = BATCH_JOB["failed"]
+    send_discord_notification(
+        "Novel Proofreader: ตรวจคิวเสร็จ" if not BATCH_STOP_REQUESTED else "Novel Proofreader: หยุดตรวจคิว",
+        final,
+        0xD8AD4C if failed else 0x3CCF91,
+    )
+
+
+def start_batch_job(folder: str, skip_reviewed: bool) -> dict:
+    global BATCH_JOB, BATCH_STOP_REQUESTED
+    chapters = chapters_in_folder(folder)
+    job_id = uuid.uuid4().hex
+    with BATCH_LOCK:
+        if BATCH_JOB and BATCH_JOB.get("running"):
+            raise RuntimeError("batch job is already running")
+        BATCH_STOP_REQUESTED = False
+        BATCH_JOB = {
+            "id": job_id,
+            "running": True,
+            "status": "running",
+            "folder": folder,
+            "queue": [{**item, "status": "เสร็จแล้ว" if item.get("reviewed") else "รอ"} for item in chapters],
+            "total": len(chapters),
+            "completed": 0,
+            "done": 0,
+            "skipped": 0,
+            "failed": 0,
+            "current_index": -1,
+            "current_file": "",
+            "current_stage": "เริ่มคิว",
+            "current_percent": 0,
+            "summary": "",
+            "changes": "",
+            "log": [],
+            "started_at": datetime.now().isoformat(timespec="seconds"),
+        }
+        append_batch_log(BATCH_JOB, f"เริ่มคิว {len(chapters)} ไฟล์")
+    thread = threading.Thread(target=run_batch_job, args=(job_id, chapters, skip_reviewed), daemon=True)
+    thread.start()
+    return batch_snapshot()
+
+
+def stop_batch_job() -> dict:
+    global BATCH_STOP_REQUESTED
+    with BATCH_LOCK:
+        BATCH_STOP_REQUESTED = True
+        if BATCH_JOB:
+            append_batch_log(BATCH_JOB, "รับคำสั่งหยุด จะหยุดหลังไฟล์ปัจจุบัน")
+    return batch_snapshot()
+
+
 INDEX_HTML = r"""<!doctype html>
 <html lang="th">
 <head>
@@ -1417,6 +1562,7 @@ INDEX_HTML = r"""<!doctype html>
     let selectedFile = null;
     const sharedStateKey = "novelProofreader.batchState.v1";
     let applyingSharedState = false;
+    let batchPollTimer = null;
 
     function showPage(page) {
       const files = page === "files";
@@ -1506,6 +1652,51 @@ INDEX_HTML = r"""<!doctype html>
       $("chapterProgressTime").textContent = "00:00";
       $("chapterProgressName").textContent = "ยังไม่ได้เริ่ม";
       saveSharedState();
+    }
+
+    function applyBatchStatus(job) {
+      if (!job || job.status === "idle") return;
+      queue = Array.isArray(job.queue) ? job.queue : [];
+      runStats = {
+        done: job.done || 0,
+        skipped: job.skipped || 0,
+        failed: job.failed || 0,
+        total: job.total || queue.length || 0
+      };
+      runLog = Array.isArray(job.log) ? job.log : [];
+      const completed = job.completed || 0;
+      const total = job.total || 0;
+      renderQueue(job.current_index ?? -1, {});
+      setProgress(completed, total);
+      $("runLog").textContent = runLog.join("\n") || "ยังไม่ได้เริ่ม";
+      $("runLog").scrollTop = $("runLog").scrollHeight;
+      $("sourceFile").value = job.current_file || "";
+      $("summary").textContent = job.summary || "";
+      $("changes").textContent = job.changes || "";
+      $("chapterProgressName").textContent = job.current_file || "ยังไม่ได้เริ่ม";
+      $("chapterProgressStage").textContent = `${job.current_percent || 0}%`;
+      $("chapterProgressFill").style.width = `${job.current_percent || 0}%`;
+      $("chapterProgressText").textContent = job.current_stage || "รอเริ่ม";
+      $("autoReview").disabled = !!job.running;
+      $("stopAuto").disabled = !job.running;
+      setStatus(job.running ? `กำลังตรวจบน server: ${completed}/${total}` : (job.status === "completed" ? "ตรวจคิวครบแล้ว" : "หยุดแล้ว"));
+      saveSharedState();
+    }
+
+    async function pollBatchStatus() {
+      try {
+        const job = await api("/api/batch-status");
+        applyBatchStatus(job);
+        if (job.running && !batchPollTimer) {
+          batchPollTimer = setInterval(pollBatchStatus, 2500);
+        }
+        if (!job.running && batchPollTimer) {
+          clearInterval(batchPollTimer);
+          batchPollTimer = null;
+        }
+      } catch (err) {
+        appendLog(`poll batch failed: ${err.message}`);
+      }
     }
 
     function saveSharedState() {
@@ -1824,66 +2015,19 @@ INDEX_HTML = r"""<!doctype html>
 
     $("autoReview").onclick = async () => {
       if (!queue.length) return setStatus("ยังไม่มีคิว ให้โหลดโฟลเดอร์ก่อน", true);
-      stopRequested = false;
-      const done = {};
       runStats = {done: 0, skipped: 0, failed: 0, total: queue.length};
       setProgress(0, queue.length);
-      appendLog("เริ่มตรวจอัตโนมัติ");
-      notifyDiscord("Novel Proofreader: เริ่มตรวจคิว", `เริ่มตรวจ ${queue.length} ไฟล์`, "info");
       $("autoReview").disabled = true;
       $("stopAuto").disabled = false;
       $("review").disabled = true;
       $("save").disabled = true;
       try {
-        for (let i = 0; i < queue.length; i++) {
-          if (stopRequested) break;
-          const item = queue[i];
-          if ($("skipReviewed").checked && item.reviewed) {
-            done[item.path] = "ข้าม/เสร็จแล้ว";
-            runStats.skipped += 1;
-            setProgress(runStats.done + runStats.skipped + runStats.failed, queue.length);
-            appendLog(`ข้าม ${item.path} เพราะมีผลตรวจแล้ว`);
-            renderQueue(-1, done);
-            continue;
-          }
-          renderQueue(i, done);
-          appendLog(`เริ่มตรวจ ${item.path}`);
-          startChapterProgress(item.path);
-          setChapterProgress(18, "ส่งคำขอไป Google API");
-          setStatus(`กำลังตรวจ ${i + 1}/${queue.length}: ${item.path}`);
-          try {
-            const data = await api("/api/auto-review", {
-              method: "POST",
-              body: JSON.stringify({path: item.path})
-            });
-            setChapterProgress(94, "ได้รับผลแล้ว กำลังบันทึก report");
-            done[item.path] = data.needs_review && data.needs_review.length ? "เสร็จ/ต้องทวน" : "เสร็จ";
-            item.reviewed = true;
-            item.reviewed_path = data.reviewed_path;
-            runStats.done += 1;
-            $("sourceFile").value = item.path;
-            $("summary").textContent = data.summary || "";
-            $("changes").textContent = `บันทึก: ${data.reviewed_path}\nรายงาน: ${data.report_path}\nchanges: ${data.changes_count}`;
-            appendLog(`เสร็จ ${item.path} changes=${data.changes_count}${data.needs_review && data.needs_review.length ? " needs_review" : ""}`);
-            finishChapterProgress(data.needs_review && data.needs_review.length ? "เสร็จ แต่ต้องทวน" : "เสร็จ");
-          } catch (err) {
-            done[item.path] = "ผิดพลาด";
-            runStats.failed += 1;
-            appendLog(`ผิดพลาด ${item.path}: ${err.message}`);
-            notifyDiscord("Novel Proofreader: ตรวจไฟล์ผิดพลาด", `${item.path}\n${err.message}`, "error");
-            finishChapterProgress("ผิดพลาด");
-          }
-          setProgress(runStats.done + runStats.skipped + runStats.failed, queue.length);
-          renderQueue(-1, done);
-        }
-        const finalMessage = `ทั้งหมด ${queue.length} | เสร็จ ${runStats.done} | ข้าม ${runStats.skipped} | พลาด ${runStats.failed}`;
-        appendLog(stopRequested ? "หยุดแล้วหลังไฟล์ล่าสุด" : "ตรวจคิวครบแล้ว");
-        notifyDiscord(
-          stopRequested ? "Novel Proofreader: หยุดตรวจคิว" : "Novel Proofreader: ตรวจคิวเสร็จ",
-          finalMessage,
-          runStats.failed ? "warning" : "success"
-        );
-        setStatus(stopRequested ? "หยุดแล้วหลังไฟล์ล่าสุด" : "ตรวจคิวครบแล้ว");
+        const job = await api("/api/batch-start", {
+          method: "POST",
+          body: JSON.stringify({folder: $("folder").value, skip_reviewed: $("skipReviewed").checked})
+        });
+        applyBatchStatus(job);
+        if (!batchPollTimer) batchPollTimer = setInterval(pollBatchStatus, 2500);
       } catch (err) {
         setStatus(err.message, true);
         notifyDiscord("Novel Proofreader: Batch error", err.message, "error");
@@ -1895,7 +2039,9 @@ INDEX_HTML = r"""<!doctype html>
     };
 
     $("stopAuto").onclick = () => {
-      stopRequested = true;
+      api("/api/batch-stop", {method: "POST", body: "{}"})
+        .then(applyBatchStatus)
+        .catch(err => setStatus(err.message, true));
       setStatus("รับคำสั่งหยุดแล้ว จะหยุดหลังไฟล์ปัจจุบันเสร็จ");
     };
 
@@ -2084,7 +2230,7 @@ INDEX_HTML = r"""<!doctype html>
     };
 
     Promise.all([loadChapters(), loadFolders(), loadConfig()])
-      .then(loadSharedState)
+      .then(() => { loadSharedState(); pollBatchStatus(); })
       .catch(err => setStatus(err.message, true));
   </script>
 </body>
@@ -2232,6 +2378,8 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_existing_file(path, path.name)
             elif parsed.path == "/api/google-models":
                 self.send_json({"models": list_google_models()})
+            elif parsed.path == "/api/batch-status":
+                self.send_json(batch_snapshot())
             elif parsed.path == "/api/chapter":
                 query = parse_qs(parsed.query)
                 chapter_path = query.get("path", [""])[0]
@@ -2256,6 +2404,11 @@ class Handler(BaseHTTPRequestHandler):
             elif self.path == "/api/notify":
                 body = self.read_json_body()
                 self.send_json(notify_from_body(body))
+            elif self.path == "/api/batch-start":
+                body = self.read_json_body()
+                self.send_json(start_batch_job(body.get("folder", ""), bool(body.get("skip_reviewed", True))))
+            elif self.path == "/api/batch-stop":
+                self.send_json(stop_batch_job())
             elif self.path == "/api/auto-review":
                 body = self.read_json_body()
                 result = auto_review_chapter(body.get("path", ""))
