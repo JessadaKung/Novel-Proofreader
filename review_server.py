@@ -93,26 +93,30 @@ def write_env_values(updates: dict[str, str]) -> None:
 
 def public_config() -> dict[str, str]:
     values = read_env_values()
-    api_key = values.get("GOOGLE_API_KEY") or values.get("GEMINI_API_KEY") or values.get("LLM_API_KEY", "")
+    def value(key: str, default: str = "") -> str:
+        return values.get(key) or os.environ.get(key, default)
+
+    api_key = value("GOOGLE_API_KEY") or value("GEMINI_API_KEY") or value("LLM_API_KEY")
+    discord_webhook = value("DISCORD_WEBHOOK_URL")
     return {
-        "LLM_PROVIDER": values.get("LLM_PROVIDER", "google"),
+        "LLM_PROVIDER": value("LLM_PROVIDER", "google"),
         "GOOGLE_API_KEY_SET": "true" if api_key else "false",
         "GOOGLE_API_KEY_PREVIEW": f"...{api_key[-4:]}" if api_key else "",
-        "LLM_MODEL": values.get("LLM_MODEL", "gemma-4-31b-it"),
-        "GOOGLE_FALLBACK_MODELS": values.get("GOOGLE_FALLBACK_MODELS", ""),
-        "GOOGLE_RETRY_COUNT": values.get("GOOGLE_RETRY_COUNT", "3"),
-        "GOOGLE_RETRY_DELAY_SECONDS": values.get("GOOGLE_RETRY_DELAY_SECONDS", "4"),
-        "GOOGLE_TIMEOUT_SECONDS": values.get("GOOGLE_TIMEOUT_SECONDS", "300"),
-        "DISCORD_WEBHOOK_SET": "true" if values.get("DISCORD_WEBHOOK_URL", "") else "false",
-        "DISCORD_WEBHOOK_PREVIEW": f"...{values.get('DISCORD_WEBHOOK_URL', '')[-8:]}" if values.get("DISCORD_WEBHOOK_URL", "") else "",
+        "LLM_MODEL": value("LLM_MODEL", "gemma-4-31b-it"),
+        "GOOGLE_FALLBACK_MODELS": value("GOOGLE_FALLBACK_MODELS"),
+        "GOOGLE_RETRY_COUNT": value("GOOGLE_RETRY_COUNT", "3"),
+        "GOOGLE_RETRY_DELAY_SECONDS": value("GOOGLE_RETRY_DELAY_SECONDS", "4"),
+        "GOOGLE_TIMEOUT_SECONDS": value("GOOGLE_TIMEOUT_SECONDS", "300"),
+        "DISCORD_WEBHOOK_SET": "true" if discord_webhook else "false",
+        "DISCORD_WEBHOOK_PREVIEW": f"...{discord_webhook[-8:]}" if discord_webhook else "",
     }
 
 
-def send_discord_notification(title: str, message: str, color: int = 0x47A3FF) -> bool:
+def send_discord_notification_result(title: str, message: str, color: int = 0x47A3FF) -> dict:
     load_env()
     webhook_url = os.environ.get("DISCORD_WEBHOOK_URL", "").strip()
     if not webhook_url:
-        return False
+        return {"sent": False, "error": "DISCORD_WEBHOOK_URL is not set"}
     payload = {
         "embeds": [
             {
@@ -131,10 +135,19 @@ def send_discord_notification(title: str, message: str, color: int = 0x47A3FF) -
     )
     try:
         with urllib.request.urlopen(request, timeout=20):
-            return True
+            return {"sent": True, "error": ""}
+    except urllib.error.HTTPError as exc:
+        body = exc.read().decode("utf-8", errors="replace")
+        error = f"Discord HTTP {exc.code}: {body}"
+        print(f"Discord webhook failed: {error}")
+        return {"sent": False, "error": error}
     except Exception as exc:
         print(f"Discord webhook failed: {exc}")
-        return False
+        return {"sent": False, "error": str(exc)}
+
+
+def send_discord_notification(title: str, message: str, color: int = 0x47A3FF) -> bool:
+    return bool(send_discord_notification_result(title, message, color).get("sent"))
 
 
 def auth_enabled() -> bool:
@@ -750,12 +763,12 @@ def notify_from_body(body: dict) -> dict[str, bool]:
         "warning": 0xD8AD4C,
         "error": 0xE06161,
     }
-    sent = send_discord_notification(
+    result = send_discord_notification_result(
         body.get("title", "Novel Proofreader"),
         body.get("message", ""),
         colors.get(level, colors["info"]),
     )
-    return {"sent": sent}
+    return result
 
 
 def save_review(source_file: str, original: str, result: dict) -> dict[str, str]:
