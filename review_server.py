@@ -873,6 +873,7 @@ def run_batch_job(job_id: str, chapters: list[dict], skip_reviewed: bool) -> Non
             BATCH_JOB["current_file"] = item["path"]
             BATCH_JOB["current_stage"] = "เริ่มตรวจ"
             BATCH_JOB["current_percent"] = 10
+            BATCH_JOB["current_started_at"] = datetime.now().isoformat(timespec="seconds")
             append_batch_log(BATCH_JOB, f"เริ่มตรวจ {item['path']}")
 
         if skip_reviewed and item.get("reviewed"):
@@ -964,6 +965,8 @@ def start_batch_job(folder: str, skip_reviewed: bool) -> dict:
             "changes": "",
             "log": [],
             "started_at": datetime.now().isoformat(timespec="seconds"),
+            "current_started_at": "",
+            "stop_requested": False,
         }
         append_batch_log(BATCH_JOB, f"เริ่มคิว {len(chapters)} ไฟล์")
     thread = threading.Thread(target=run_batch_job, args=(job_id, chapters, skip_reviewed), daemon=True)
@@ -976,7 +979,9 @@ def stop_batch_job() -> dict:
     with BATCH_LOCK:
         BATCH_STOP_REQUESTED = True
         if BATCH_JOB:
-            append_batch_log(BATCH_JOB, "รับคำสั่งหยุด จะหยุดหลังไฟล์ปัจจุบัน")
+            if not BATCH_JOB.get("stop_requested"):
+                append_batch_log(BATCH_JOB, "รับคำสั่งหยุด จะหยุดหลังไฟล์ปัจจุบัน")
+            BATCH_JOB["stop_requested"] = True
     return batch_snapshot()
 
 
@@ -1605,6 +1610,16 @@ INDEX_HTML = r"""<!doctype html>
       return `${min}:${sec}`;
     }
 
+    function estimatedBatchChapterPercent(job) {
+      const base = job.current_percent || 0;
+      if (!job.running || base >= 100 || !job.current_started_at) return base;
+      if (!String(job.current_stage || "").includes("Google API")) return base;
+      const started = Date.parse(job.current_started_at);
+      if (!started) return base;
+      const elapsedSeconds = Math.floor((Date.now() - started) / 1000);
+      return Math.min(90, Math.max(base, 25 + Math.floor(elapsedSeconds / 8) * 3));
+    }
+
     function setChapterProgress(percent, stage, file="") {
       chapterEstimatedPercent = Math.max(chapterEstimatedPercent, percent);
       $("chapterProgressFill").style.width = `${chapterEstimatedPercent}%`;
@@ -1674,9 +1689,15 @@ INDEX_HTML = r"""<!doctype html>
       $("summary").textContent = job.summary || "";
       $("changes").textContent = job.changes || "";
       $("chapterProgressName").textContent = job.current_file || "ยังไม่ได้เริ่ม";
-      $("chapterProgressStage").textContent = `${job.current_percent || 0}%`;
-      $("chapterProgressFill").style.width = `${job.current_percent || 0}%`;
-      $("chapterProgressText").textContent = job.current_stage || "รอเริ่ม";
+      const chapterPercent = estimatedBatchChapterPercent(job);
+      $("chapterProgressStage").textContent = `${chapterPercent}%`;
+      $("chapterProgressFill").style.width = `${chapterPercent}%`;
+      const waitingSuffix = job.stop_requested && job.running ? " (จะหยุดหลังไฟล์นี้)" : "";
+      $("chapterProgressText").textContent = `${job.current_stage || "รอเริ่ม"}${waitingSuffix}`;
+      if (job.current_started_at) {
+        const started = Date.parse(job.current_started_at);
+        if (started) $("chapterProgressTime").textContent = formatElapsed(Date.now() - started);
+      }
       $("autoReview").disabled = !!job.running;
       $("stopAuto").disabled = !job.running;
       setStatus(job.running ? `กำลังตรวจบน server: ${completed}/${total}` : (job.status === "completed" ? "ตรวจคิวครบแล้ว" : "หยุดแล้ว"));
