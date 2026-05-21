@@ -13,6 +13,7 @@ import zipfile
 import tempfile
 import threading
 import uuid
+import concurrent.futures
 from email import policy
 from email.parser import BytesParser
 from datetime import UTC, datetime
@@ -890,7 +891,16 @@ def run_batch_job(job_id: str, chapters: list[dict], skip_reviewed: bool) -> Non
 
         try:
             update_batch_job(current_stage="ส่งคำขอไป Google API", current_percent=25)
-            result = auto_review_chapter(item["path"])
+            file_timeout = float(os.environ.get("BATCH_FILE_TIMEOUT_SECONDS") or os.environ.get("GOOGLE_TIMEOUT_SECONDS", "300"))
+            executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+            future = executor.submit(auto_review_chapter, item["path"])
+            try:
+                result = future.result(timeout=file_timeout)
+            except concurrent.futures.TimeoutError as exc:
+                future.cancel()
+                raise TimeoutError(f"File review timed out after {int(file_timeout)} seconds") from exc
+            finally:
+                executor.shutdown(wait=False, cancel_futures=True)
             with BATCH_LOCK:
                 if BATCH_JOB is None:
                     return
