@@ -536,9 +536,38 @@ Text:
 """.strip()
 
     if provider == "google":
-        return call_google_llm(system_prompt, user_prompt, text)
+        return ensure_result_shape(call_google_llm(system_prompt, user_prompt, text), text)
 
-    return call_openai_compatible_llm(model, system_prompt, user_prompt)
+    return ensure_result_shape(call_openai_compatible_llm(model, system_prompt, user_prompt, text), text)
+
+
+def ensure_result_shape(result: dict, original_text: str) -> dict:
+    result.setdefault("revised", original_text)
+    result.setdefault("changes", [])
+    result.setdefault("needs_review", [])
+    result.setdefault("summary", "")
+    if not result.get("revised"):
+        result["revised"] = original_text
+    return result
+
+
+def parse_model_result(content: str, original_text: str, model_name: str) -> dict:
+    try:
+        return extract_json(content)
+    except Exception as exc:
+        return {
+            "revised": original_text,
+            "changes": [
+                {
+                    "type": "note",
+                    "before": "",
+                    "after": "",
+                    "reason": f"Could not parse JSON returned by {model_name}: {exc}. Raw preview: {content[:500]}",
+                }
+            ],
+            "needs_review": [f"Model returned invalid JSON from {model_name}; kept original text for manual review."],
+            "summary": "โมเดลคืน JSON ไม่สมบูรณ์ จึงคงข้อความเดิมไว้และทำเครื่องหมาย needs review",
+        }
 
 
 def google_models_to_try() -> list[str]:
@@ -662,15 +691,10 @@ def call_google_llm(system_prompt: str, user_prompt: str, original_text: str) ->
             "needs_review": ["Google API returned no text. Review this chapter manually."],
             "summary": "Google API ไม่คืนข้อความ จึงคงต้นฉบับเดิมไว้และทำเครื่องหมาย needs review",
         }
-    result = extract_json(content)
-    result.setdefault("revised", "")
-    result.setdefault("changes", [])
-    result.setdefault("needs_review", [])
-    result.setdefault("summary", "")
-    return result
+    return parse_model_result(content, original_text, last_model_name)
 
 
-def call_openai_compatible_llm(model: str, system_prompt: str, user_prompt: str) -> dict:
+def call_openai_compatible_llm(model: str, system_prompt: str, user_prompt: str, original_text: str = "") -> dict:
     base_url = os.environ.get("LLM_BASE_URL", "").rstrip("/")
     api_key = os.environ.get("LLM_API_KEY", "")
     if not base_url or not api_key:
@@ -701,12 +725,7 @@ def call_openai_compatible_llm(model: str, system_prompt: str, user_prompt: str)
         raise RuntimeError(f"LLM API error {exc.code}: {body}") from exc
 
     content = data["choices"][0]["message"]["content"]
-    result = extract_json(content)
-    result.setdefault("revised", "")
-    result.setdefault("changes", [])
-    result.setdefault("needs_review", [])
-    result.setdefault("summary", "")
-    return result
+    return parse_model_result(content, original_text, model)
 
 
 def list_google_models() -> list[dict[str, str]]:
