@@ -13,7 +13,7 @@ import zipfile
 import tempfile
 from email import policy
 from email.parser import BytesParser
-from datetime import datetime
+from datetime import UTC, datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
@@ -123,14 +123,17 @@ def send_discord_notification_result(title: str, message: str, color: int = 0x47
                 "title": title[:256],
                 "description": message[:4000],
                 "color": color,
-                "timestamp": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+                "timestamp": datetime.now(UTC).isoformat(timespec="seconds").replace("+00:00", "Z"),
             }
         ]
     }
     request = urllib.request.Request(
         webhook_url,
         data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
-        headers={"Content-Type": "application/json"},
+        headers={
+            "Content-Type": "application/json",
+            "User-Agent": "Novel-Proofreader/1.0 (+https://github.com/JessadaKung/Novel-Proofreader)",
+        },
         method="POST",
     )
     try:
